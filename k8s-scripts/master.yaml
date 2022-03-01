@@ -1,0 +1,175 @@
+---
+- hosts: all
+  become: true
+  gather_facts: yes
+  tasks:
+  - name: Check war files in release
+    local_action: stat path="/vagrant/.ssh/id_rsa.pub"
+    register: key_file
+
+
+  - name: Set authorized key taken from file
+    authorized_key:
+      user: vagrant
+      state: present
+      key: "{{ lookup('file', '/vagrant/.ssh/id_rsa.pub') }}"
+    when: key_file.stat.exists == True
+
+  
+  - name: Reset existing cluster components if any
+    command: kubeadm reset -f
+
+  - name: Remove default IP route for service network
+    command: "ip route flush 10.96.0.0/16"
+
+  - name: Recursively remove directory
+    ansible.builtin.file:
+      path: "{{ item }}"
+      state: absent
+    with_items:
+      - /root/.kube
+      - /vagrant/.kube 
+      - /etc/cni/net.d 
+      - /etc/kubernetes 
+      - /var/lib/etcd 
+      - /var/lib/kubelet 
+      - /var/run/kubernetes 
+      - /var/lib/cni 
+      - /opt/cni
+
+  - name: Set custom rc
+    shell: sh /etc/k8s-init-scripts/set-custom-rc.sh
+    become: false    
+
+  - name: Iptables flush filter
+    ansible.builtin.iptables:
+      flush: yes
+ 
+  - name: Configure default IP route for service network
+    command: "ip route add 10.96.0.0/16 dev eth1 src {{ ansible_eth1.ipv4.address }}"
+
+  - name: Create custom configuration
+    replace:
+      path: /etc/k8s-init-scripts/kubeadm-config.yaml
+      regexp: "{{ item.regexp }}"
+      replace: "{{ item.replace }}"
+    with_items:
+      - { regexp: "IPADDRESS", replace: "{{ ansible_eth1.ipv4.address }}" }
+      - { regexp: "HOSTNAME", replace: "{{ ansible_hostname }}" }
+      - { regexp: "PODSUBNET", replace: "{{ pod_network_cidr }}" }
+      
+  - name: Initialize the Kubernetes cluster using kubeadm
+    command: kubeadm init --config /etc/k8s-init-scripts/kubeadm-config.yaml --ignore-preflight-errors=NumCPU
+
+  - name: Create new directory for Kubenetes config
+    ansible.builtin.file:
+      path: "{{ item }}"
+      state: directory
+      recurse: yes
+    with_items:
+      - /home/vagrant/.kube
+      - /root/.kube
+      - /vagrant/.kube
+
+  - name: Copy file with owner and permissions
+    ansible.builtin.copy:
+      remote_src: yes
+      src: "{{ item.src }}"
+      dest: "{{ item.dest }}"
+      owner: root
+      group: root
+      mode: '0644'
+    with_items:
+      - { src: /etc/kubernetes/admin.conf, dest: /home/vagrant/.kube/config }
+      - { src: /etc/kubernetes/admin.conf, dest: /root/.kube/config }
+    become: true
+      
+  - name: Recursively change ownership of a directory
+    ansible.builtin.file:
+      path: /home/vagrant/.kube/
+      state: directory
+      recurse: yes
+      owner: vagrant
+      group: vagrant
+
+  - name: Untaint the master nodes
+    command: kubectl taint nodes --all node-role.kubernetes.io/master-
+  
+  - name: Install calico pod network
+    become: false
+    command: kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
+    when: nw_plugin == 'calico'
+
+  - name: Get the kubectl version
+    shell: kubectl version | base64 | tr -d '\n'
+    register: kubectl_version
+
+  - name: Install weave pod network
+    become: false
+    command: "kubectl apply -f https://cloud.weave.works/k8s/net?k8s-version={{ kubectl_version.stdout_lines[0] }}"
+    when: nw_plugin == 'weave'
+
+  - name: Install secure dashboard
+    become: false
+    command: "kubectl apply -f https://raw.githubusercontent.com/coolsvap/cks-prep/main/01-dashboard/dashboard.yaml"
+    when: insecure_dashboard == 'no'
+
+  - name: Install insecure dashboard
+    become: false
+    command: "kubectl apply -f https://raw.githubusercontent.com/coolsvap/cks-prep/main/01-dashboard/dashboard-insecure.yaml"
+    when: insecure_dashboard == 'yes'
+  
+  - name: Install metrics server
+    become: false
+    command: "kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml"
+
+  - name: Create metallb configuration
+    replace:
+      path: /etc/k8s-init-scripts/metallb-config.yaml
+      regexp: "{{ item.regexp }}"
+      replace: "{{ item.replace }}"
+    with_items:
+      - { regexp: "LB_IPPOOL", replace: "{{ lb_ippool }}" }
+
+  - name: Enable MetalLB
+    become: false
+    command: "{{ item}}"
+    with_items:
+      - "kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.10.2/manifests/namespace.yaml"
+      - "kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.10.2/manifests/metallb.yaml"
+      - "kubectl apply -f /etc/k8s-init-scripts/metallb-config.yaml"
+  
+  - name: Enable Ingress
+    become: false
+    command: "kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v0.47.0/deploy/static/provider/cloud/deploy.yaml"
+  
+  - name: Install Helm
+    become: true
+    command: "{{ item }}"
+    with_items:
+      - "curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3"
+      - "chmod 700 get_helm.sh"
+      - "./get_helm.sh"
+      - "rm -rf ./get_helm.sh"
+    when: install_helm == 'yes'
+  
+  - name: Enable OLM
+    become: true
+    command: "sh /etc/k8s-init-scripts/enable-olm.sh"
+    when: enable_olm == 'yes'
+    async: 1200
+    poll: 0
+
+  - name: Generate join command
+    command: kubeadm token create --print-join-command --ttl 0
+    register: join_command
+
+  - name: Copy join command to local file
+    local_action: copy content="{{ join_command.stdout_lines[0] }}" dest="/etc/.vagrantdata/kubeadm-join"
+   
+
+  - name: Create a cron job for approving the nodes
+    ansible.builtin.cron:
+      name: "approve_node_csrs"
+      minute: "*/1"
+      job: "sh /etc/k8s-init-scripts/approve-nodes.sh"

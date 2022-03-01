@@ -5,7 +5,8 @@ Vagrant.configure("2") do |config|
   #config.vm.box_version = ENV["BOX_VERSION"]
   config.vm.box_check_update = false
   config.vm.synced_folder "data/", "/etc/.vagrantdata/"
-  config.vm.synced_folder "scripts/", "/etc/k8s2-scripts/"
+  config.vm.synced_folder "k8s-init-scripts/", "/etc/k8s-init-scripts/"
+  config.vm.synced_folder "k8s-scripts/", "/etc/k8s-scripts/"
   config.ssh.username = 'vagrant'
   config.ssh.password = 'vagrant'
   
